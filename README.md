@@ -11,6 +11,16 @@ wavio
 
 The functions can read and write 8-, 16-, 24- and 32-bit integer WAV files.
 
+``wavio.read`` also exposes the raw RIFF chunks of the file (e.g. ``cue ``,
+``LIST``/``INFO``, ``smpl``) in the ``chunks`` attribute of the returned
+object, in the order in which they occur in the file.  Passing that tuple
+back to ``wavio.write`` via its ``chunks`` parameter merges the extended
+chunks into the output file; the chunk sizes and offsets are recomputed in
+coordination with the ``data`` chunk, unknown chunks are passed through
+unchanged, and for a standard PCM file the round trip is byte-for-byte
+identical.  A corrupt chunk structure or a duplicated singleton chunk
+raises ``wavio.WavChunkError``.
+
 The module uses the ``wave`` module in Python's standard library, so it has
 the same limitations as that module.  In particular, the ``wave`` module
 does not support compressed WAV files, and it does not handle floating

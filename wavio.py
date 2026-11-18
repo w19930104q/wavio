@@ -3,10 +3,15 @@ The wavio module defines the functions:
 
 read(file)
     Read a WAV file and return a `wavio.Wav` object, with attributes
-    `data`, `rate` and `sampwidth`.
+    `data`, `rate`, `sampwidth` and `chunks`.  `chunks` is a tuple of
+    `wavio.Chunk` objects that exposes the raw RIFF chunks of the file
+    (e.g. 'cue ', 'LIST', 'smpl', ...) in the order in which they occur
+    in the file.
 
-write(filename, data, rate, scale=None, sampwidth=None)
-    Write a numpy array to a WAV file.
+write(filename, data, rate, scale=None, sampwidth=None, chunks=None)
+    Write a numpy array to a WAV file.  If `chunks` is given, the extra
+    RIFF chunks are merged into the output; the chunk offsets and sizes
+    are recomputed in coordination with the 'data' chunk.
 
 
 -----
@@ -38,7 +43,10 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
 """
 
-from typing import BinaryIO, Literal, cast
+from typing import BinaryIO, Iterable, Literal, cast
+import io as _io
+import os as _os
+import struct as _struct
 import warnings as _warnings
 from dataclasses import dataclass
 import wave as _wave
@@ -65,6 +73,114 @@ class ClippedDataError(RuntimeError):
             message = ('Some data values were clipped when converted to the '
                        'output format.')
         self.args = (message,)
+
+
+class WavChunkError(_wave.Error):
+    """
+    Exception raised when the RIFF chunk structure of a WAV file (or of
+    the `chunks` argument of `wavio.write`) is corrupt or invalid, e.g.
+    a truncated chunk, or a duplicate of a chunk that may occur at most
+    once.  This is a subclass of `wave.Error`.
+    """
+
+
+@dataclass(frozen=True, kw_only=True)
+class Chunk:
+    """
+    A raw RIFF chunk of a WAV file.
+
+    Attributes
+    ----------
+    id : bytes
+        The 4-byte chunk identifier (e.g. ``b'fmt '``, ``b'cue '``,
+        ``b'LIST'``).
+    data : bytes
+        The raw payload of the chunk, not including the 8-byte chunk
+        header and not including the padding byte.
+    pad : bool
+        Whether a padding byte follows the chunk payload in the file.
+        By default (``pad=None``), the standard convention is used: the
+        padding byte is present if and only if ``len(data)`` is odd.
+    """
+    id: bytes
+    data: bytes
+    pad: bool | None = None
+
+    def __post_init__(self):
+        id_ = bytes(self.id)
+        if len(id_) != 4:
+            raise ValueError('The chunk id must be exactly 4 bytes, '
+                             f'got {id_!r}.')
+        data = bytes(self.data)
+        object.__setattr__(self, 'id', id_)
+        object.__setattr__(self, 'data', data)
+        if self.pad is None:
+            object.__setattr__(self, 'pad', bool(len(data) & 1))
+
+    def __repr__(self):
+        return f"Chunk(id={self.id!r}, len(data)={len(self.data)})"
+
+
+# Chunk ids that may occur at most once in a standard WAV file.  'LIST'
+# is deliberately not included: a file may contain several LIST chunks
+# (e.g. an 'INFO' list and an 'adtl' list).  Duplicates of unknown chunk
+# ids are also allowed, since their semantics are not known.
+_singleton_chunk_ids = {b'fmt ', b'data', b'cue ', b'fact', b'smpl',
+                        b'plst', b'inst', b'bext'}
+
+
+def _read_chunks(f):
+    """
+    Walk the RIFF chunk structure of the file object `f`, starting at the
+    current position, and return the chunks as a tuple of `Chunk` objects
+    in the order in which they occur in the file.  Raises `WavChunkError`
+    if the structure is corrupt.
+    """
+    header = f.read(12)
+    if len(header) < 12:
+        raise WavChunkError('not a RIFF/WAVE file: the file is too short '
+                            f'({len(header)} bytes) to hold a RIFF header.')
+    riff_id, _, wave_id = header[:4], header[4:8], header[8:12]
+    if riff_id != b'RIFF':
+        raise WavChunkError("not a RIFF file: the file starts with "
+                            f"{riff_id!r}, not b'RIFF'.")
+    if wave_id != b'WAVE':
+        raise WavChunkError("not a WAVE file: the RIFF form type is "
+                            f"{wave_id!r}, not b'WAVE'.")
+    chunks = []
+    seen_singletons = set()
+    offset = 12
+    while True:
+        hdr = f.read(8)
+        if len(hdr) == 0:
+            break
+        if len(hdr) < 8:
+            raise WavChunkError('corrupt WAV file: truncated chunk header '
+                                f'at offset {offset} (expected 8 bytes, '
+                                f'got {len(hdr)}).')
+        cid = hdr[:4]
+        size = _struct.unpack('<I', hdr[4:])[0]
+        data = f.read(size)
+        if len(data) < size:
+            raise WavChunkError(f'corrupt WAV file: chunk {cid!r} at offset '
+                                f'{offset} declares {size} data bytes, but '
+                                f'the file ends after {len(data)}.')
+        offset += 8 + size
+        pad = False
+        if size & 1:
+            # A missing pad byte at the end of the file is tolerated
+            # (the `wave` module itself does not write a pad byte after
+            # an odd-sized 'data' chunk).
+            pad = len(f.read(1)) == 1
+            if pad:
+                offset += 1
+        if cid in _singleton_chunk_ids:
+            if cid in seen_singletons:
+                raise WavChunkError('corrupt WAV file: duplicate chunk '
+                                    f'{cid!r} at offset {offset - 8 - size}.')
+            seen_singletons.add(cid)
+        chunks.append(Chunk(id=cid, data=data, pad=pad))
+    return tuple(chunks)
 
 
 def _wav2array(nchannels, sampwidth, data):
@@ -143,11 +259,20 @@ class Wav:
     sampwidth : int
         The sample width (i.e. number of bytes per sample) of the WAV file.
         For example, `sampwidth == 3` is a 24 bit WAV file.
+    chunks : tuple of `Chunk`
+        The raw RIFF chunks of the file, in the order in which they occur
+        in the file.  This includes the 'fmt ' and 'data' chunks, so the
+        positions of the other chunks (e.g. 'cue ', 'LIST', 'smpl')
+        relative to the audio data are preserved.  Passing this tuple to
+        `wavio.write` via its `chunks` parameter preserves the extended
+        chunks of the file; for a standard PCM file, the output of such
+        a read/write round trip is byte-for-byte identical to the input.
 
     """
     data: _np.ndarray
     rate: int
     sampwidth: int
+    chunks: tuple = ()
 
     def __repr__(self):
         return (f"Wav(data.shape={self.data.shape}, "
@@ -190,6 +315,9 @@ def read(file: BinaryIO | str) -> Wav:
             sampwidth : int
                 The sample width (i.e. number of bytes per sample) of the
                 WAV file.  For example, `sampwidth == 3` is a 24 bit WAV file.
+            chunks : tuple of `wavio.Chunk`
+                The raw RIFF chunks of the file, in file order.  See the
+                docstring of `wavio.Wav` for details.
 
     Notes
     -----
@@ -197,6 +325,12 @@ def read(file: BinaryIO | str) -> Wav:
     to read the WAV file, so it has the same limitations as that library.
     In particular, the function does not read compressed WAV files, and
     it does not read files with floating point data.
+
+    In addition to decoding the audio data, the RIFF chunk structure of
+    the file is validated while the raw chunks are collected.  A corrupt
+    chunk structure (e.g. a truncated chunk) or a duplicate of a chunk
+    that may occur at most once (such as 'fmt ', 'data' or 'cue ')
+    raises `wavio.WavChunkError` (a subclass of `wave.Error`).
 
     The array returned by `wavio.read` is always two-dimensional.  If the
     WAV data is mono, the array will have shape (num_samples, 1).
@@ -206,14 +340,30 @@ def read(file: BinaryIO | str) -> Wav:
     contains 24 bit samples, the resulting numpy array is 32 bit integers,
     with values that have been sign-extended.
     """
-    with _wave.open(file) as wav:
+    if isinstance(file, (str, _os.PathLike)):
+        with open(file, 'rb') as f:
+            return _read_wav(f)
+    return _read_wav(file)
+
+
+def _read_wav(f):
+    try:
+        pos = f.tell()
+    except (AttributeError, OSError):
+        # The file object is not seekable; slurp it into a seekable
+        # buffer so the chunk walk can be followed by the `wave` read.
+        f = _io.BytesIO(f.read())
+        pos = 0
+    chunks = _read_chunks(f)
+    f.seek(pos)
+    with _wave.open(f) as wav:
         rate = wav.getframerate()
         nchannels = wav.getnchannels()
         sampwidth = wav.getsampwidth()
         nframes = wav.getnframes()
         data = wav.readframes(nframes)
     array = _wav2array(nchannels, sampwidth, data)
-    return Wav(data=array, rate=rate, sampwidth=sampwidth)
+    return Wav(data=array, rate=rate, sampwidth=sampwidth, chunks=chunks)
 
 
 _sampwidth_dtypes = {1: _np.uint8,
@@ -273,12 +423,130 @@ def _round_with_half_towards_zero(x):
 _sampwidth_t = Literal[1, 2, 3, 4]
 
 
+def _as_chunk(obj):
+    """Coerce `obj` to a `Chunk`, with a clear error if that fails."""
+    if isinstance(obj, Chunk):
+        return obj
+    try:
+        return Chunk(id=obj.id, data=obj.data, pad=getattr(obj, 'pad', None))
+    except AttributeError:
+        raise TypeError('each item of `chunks` must be a wavio.Chunk (or '
+                        'an object with `id` and `data` attributes), got '
+                        f'{obj!r}.')
+
+
+def _fmt_chunk_data(nchannels, sampwidth, rate):
+    """Generate the 16 byte PCM 'fmt ' chunk payload.
+
+    This is exactly the payload written by the `wave` module of the
+    standard library.
+    """
+    return _struct.pack('<HHIIHH', 1, nchannels, rate,
+                        rate*nchannels*sampwidth,
+                        nchannels*sampwidth, 8*sampwidth)
+
+
+def _fmt_matches(fmt_data, nchannels, sampwidth, rate):
+    """
+    Return True if the 'fmt ' chunk payload `fmt_data` describes the same
+    PCM format as the given parameters.  This allows the original 'fmt '
+    bytes (which might use a nonminimal encoding such as 18 bytes with a
+    cbSize field, or WAVE_FORMAT_EXTENSIBLE) to be passed through on a
+    read/write round trip.
+    """
+    if len(fmt_data) < 16:
+        return False
+    tag, ch, r, byterate, blockalign, bits = _struct.unpack('<HHIIHH',
+                                                            fmt_data[:16])
+    if tag not in (1, 0xFFFE):  # WAVE_FORMAT_PCM, WAVE_FORMAT_EXTENSIBLE
+        return False
+    return (ch == nchannels and r == rate and bits == 8*sampwidth
+            and blockalign == nchannels*sampwidth
+            and byterate == rate*blockalign)
+
+
+def _merge_chunks(chunks, nchannels, sampwidth, rate, wavdata):
+    """
+    Merge `chunks` with the 'fmt ' and 'data' chunks generated from the
+    other arguments, and return a list of (id, payload, pad) tuples in
+    output order.  'fmt ' and 'data' entries in `chunks` are used as
+    position markers only; their payloads are regenerated (the original
+    'fmt ' payload is kept if it matches the output format).  If `chunks`
+    contains no 'fmt ' or 'data' entry, the 'fmt ' chunk is placed first
+    and the 'data' chunk last.
+    """
+    out = []  # items are ('fmt', src), ('data', src) or ('raw', chunk)
+    fmt_src = None
+    data_src = None
+    seen_singletons = set()
+    for obj in chunks:
+        ch = _as_chunk(obj)
+        if ch.id in _singleton_chunk_ids:
+            if ch.id in seen_singletons:
+                raise WavChunkError(f'duplicate chunk {ch.id!r} in `chunks`.')
+            seen_singletons.add(ch.id)
+        if ch.id == b'fmt ':
+            fmt_src = ch
+            out.append(('fmt', ch))
+        elif ch.id == b'data':
+            data_src = ch
+            out.append(('data', ch))
+        else:
+            out.append(('raw', ch))
+    if fmt_src is None:
+        out.insert(0, ('fmt', None))
+    if data_src is None:
+        out.append(('data', None))
+
+    fmt_data = _fmt_chunk_data(nchannels, sampwidth, rate)
+    fmt_pad = False
+    if fmt_src is not None and _fmt_matches(fmt_src.data, nchannels,
+                                            sampwidth, rate):
+        # The original 'fmt ' payload describes the same format; keep its
+        # exact bytes so a read/write round trip is byte-for-byte exact.
+        fmt_data = fmt_src.data
+        fmt_pad = fmt_src.pad
+    data_pad = data_src.pad if data_src is not None else False
+
+    merged = []
+    for kind, ch in out:
+        if kind == 'fmt':
+            merged.append((b'fmt ', fmt_data, fmt_pad))
+        elif kind == 'data':
+            merged.append((b'data', wavdata, data_pad))
+        else:
+            merged.append((ch.id, ch.data, ch.pad))
+    return merged
+
+
+def _build_riff(chunks, nchannels, sampwidth, rate, wavdata):
+    """
+    Build the complete RIFF/WAVE byte string from `chunks` merged with
+    the generated 'fmt ' and 'data' chunks.  All chunk sizes, padding and
+    the RIFF size field are recomputed from the actual payloads, so the
+    chunk offsets are consistent with the final position of the 'data'
+    chunk.
+    """
+    merged = _merge_chunks(chunks, nchannels, sampwidth, rate, wavdata)
+    riff_size = 4  # 4 bytes for the 'WAVE' form type
+    for _, payload, pad in merged:
+        riff_size += 8 + len(payload) + (1 if pad else 0)
+    out = bytearray()
+    out += b'RIFF' + _struct.pack('<I', riff_size) + b'WAVE'
+    for cid, payload, pad in merged:
+        out += cid + _struct.pack('<I', len(payload)) + payload
+        if pad:
+            out += b'\x00'
+    return bytes(out)
+
+
 def write(file: BinaryIO | str,
           data: ArrayLike,
           rate: int,
           scale: float | Literal["auto"] | None = None,
           sampwidth: _sampwidth_t | None = None,
-          clip: Literal["ignore", "warn", "raise"] = "warn") -> None:
+          clip: Literal["ignore", "warn", "raise"] = "warn",
+          chunks: Iterable[Chunk] | None = None) -> None:
     """
     Write the numpy array `data` to a WAV file.
 
@@ -351,6 +619,27 @@ def write(file: BinaryIO | str,
         of the output array.  If "raise", the function will raise an
         exception if clipping occurs.  If "ignore", no warning or
         exception is generated if clipping occurs.
+    chunks : sequence of `wavio.Chunk`, optional
+        Additional RIFF chunks to merge into the output file, in the
+        given order.  Unknown chunks are passed through unchanged.  The
+        chunk sizes, padding and the RIFF size field are recomputed when
+        the chunks are merged, so all chunk offsets are consistent with
+        the final position of the 'data' chunk.
+
+        Entries with the id ``b'fmt '`` or ``b'data'`` are used as
+        position markers only; their contents are generated from the
+        other parameters (the original 'fmt ' payload is kept if it
+        describes the same PCM format).  If `chunks` contains no 'fmt '
+        or 'data' entry, the 'fmt ' chunk is written first and the
+        'data' chunk last.
+
+        Passing the `chunks` attribute of the `wavio.Wav` object returned
+        by `wavio.read` preserves the extended chunks of the original
+        file (cue points, loop points, 'LIST'/'INFO' metadata, etc.);
+        for a standard PCM file, the output of such a read/write round
+        trip is byte-for-byte identical to the input.  A duplicate of a
+        chunk that may occur at most once (such as 'fmt ', 'data' or
+        'cue ') raises `wavio.WavChunkError`.
 
     Examples
     --------
@@ -481,6 +770,16 @@ def write(file: BinaryIO | str,
         data_arr = data_arr.reshape(-1, 1)
 
     wavdata = _array2wav(data_arr, sampwidth)
+
+    if chunks is not None:
+        payload = _build_riff(chunks, data_arr.shape[1], sampwidth, rate,
+                              wavdata)
+        if isinstance(file, (str, _os.PathLike)):
+            with open(file, 'wb') as f:
+                f.write(payload)
+        else:
+            file.write(payload)
+        return
 
     with _wave.open(file, 'wb') as w:
         w.setnchannels(data_arr.shape[1])
