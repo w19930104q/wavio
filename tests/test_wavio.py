@@ -269,3 +269,258 @@ class TestWavio:
                                  2**23 - 2, 2**23 - 1, 2**23 - 1])
             actual = w.data[:, 0]
             np.testing.assert_array_equal(actual, expected)
+
+
+class TestChunked:
+
+    @pytest.mark.parametrize('sampwidth,dtype',
+                             [(1, np.uint8),
+                              (2, int16le),
+                              (3, int32le),
+                              (4, int32le)])
+    @pytest.mark.parametrize('nchannels', [1, 2])
+    def test_read_chunks_matches_read(self, sampwidth, dtype, nchannels):
+        nframes = 37
+        rng = np.random.default_rng(0)
+        info = np.iinfo(dtype)
+        data = rng.integers(info.min, info.max,
+                            size=(nframes, nchannels), dtype=dtype)
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('full.wav', data, rate=8000, sampwidth=sampwidth)
+
+            w = wavio.read('full.wav')
+            # Chunk sizes chosen so that the data does not divide evenly:
+            # the last chunk must be the short one.
+            for chunk_size in [1, 7, 100]:
+                chunks = list(wavio.read_chunks('full.wav', chunk_size))
+                assert all(c.ndim == 2 for c in chunks)
+                assert all(c.shape[1] == nchannels for c in chunks)
+                assert all(c.dtype == w.data.dtype for c in chunks)
+                assert sum(c.shape[0] for c in chunks) == nframes
+                np.testing.assert_array_equal(np.concatenate(chunks),
+                                              w.data)
+
+    def test_read_chunks_24bit_sign_extension(self):
+        # Values spanning the sign boundary must be sign-extended in
+        # every chunk, including chunks that begin on an arbitrary frame.
+        data = np.array([-2**23, -1, 0, 1, 2**23 - 1,
+                         -12345678, 12345678, -2**23 + 1],
+                        dtype=int32le)
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('signext.wav', data, rate=8000, sampwidth=3)
+            w = wavio.read('signext.wav')
+            for chunk_size in [1, 2, 3, 5]:
+                chunks = list(wavio.read_chunks('signext.wav', chunk_size))
+                np.testing.assert_array_equal(np.concatenate(chunks),
+                                              w.data)
+
+    def test_read_chunks_bad_chunk_size(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('x.wav', data1, rate=8000, sampwidth=3)
+            with pytest.raises(ValueError):
+                list(wavio.read_chunks('x.wav', chunk_size=0))
+            with pytest.raises(ValueError):
+                list(wavio.read_chunks('x.wav', chunk_size=-3))
+
+    @pytest.mark.parametrize('sampwidth', [1, 2, 3, 4])
+    @pytest.mark.parametrize('nchannels', [1, 2])
+    def test_write_chunks_integer_matches_write(self, sampwidth, nchannels):
+        nframes = 41
+        rng = np.random.default_rng(1)
+        dtype = {1: np.uint8, 2: np.int16, 3: np.int32,
+                 4: np.int32}[sampwidth]
+        info = np.iinfo(dtype)
+        data = rng.integers(info.min, info.max,
+                            size=(nframes, nchannels), dtype=dtype)
+        chunk_sizes = [1, 3, 8, 1000]
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('whole.wav', data, rate=11025, sampwidth=sampwidth)
+            whole_bytes = open('whole.wav', 'rb').read()
+            for chunk_size in chunk_sizes:
+                name = f'chunked_{sampwidth}_{nchannels}_{chunk_size}.wav'
+                chunks = (data[i:i + chunk_size]
+                          for i in range(0, nframes, chunk_size))
+                wavio.write_chunks(chunks, name, rate=11025,
+                                   sampwidth=sampwidth)
+                assert open(name, 'rb').read() == whole_bytes
+
+    @pytest.mark.parametrize('sampwidth', [1, 2, 3, 4])
+    def test_write_chunks_float_matches_write(self, sampwidth):
+        nframes = 53
+        rng = np.random.default_rng(2)
+        data = rng.normal(scale=0.7, size=(nframes, 2)).astype(np.float64)
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('whole.wav', data, rate=22050, sampwidth=sampwidth,
+                        scale=2.5, clip='ignore')
+            whole_bytes = open('whole.wav', 'rb').read()
+            for chunk_size in [1, 4, 9, 1000]:
+                name = f'chunked_f_{sampwidth}_{chunk_size}.wav'
+                chunks = [data[i:i + chunk_size]
+                          for i in range(0, nframes, chunk_size)]
+                wavio.write_chunks(chunks, name, rate=22050,
+                                   sampwidth=sampwidth, scale=2.5,
+                                   clip='ignore')
+                assert open(name, 'rb').read() == whole_bytes
+
+    def test_write_chunks_one_dimensional_input(self):
+        data = data1.copy()
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('whole.wav', data, rate=8000, sampwidth=3)
+            whole_bytes = open('whole.wav', 'rb').read()
+            chunks = [data[i:i + 4] for i in range(0, len(data), 4)]
+            wavio.write_chunks(chunks, 'chunked.wav', rate=8000,
+                               sampwidth=3)
+            assert open('chunked.wav', 'rb').read() == whole_bytes
+
+    def test_wavwriter_round_trip_via_read_chunks(self):
+        rng = np.random.default_rng(3)
+        data = rng.integers(-2**23, 2**23, size=(100, 2), dtype=int32le)
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            with wavio.WavWriter('stream.wav', rate=48000, sampwidth=3,
+                                 nchannels=2) as writer:
+                for i in range(0, len(data), 17):
+                    writer.write_chunk(data[i:i + 17])
+            w = wavio.read('stream.wav')
+            np.testing.assert_array_equal(w.data, data)
+            assert w.rate == 48000
+            assert w.sampwidth == 3
+
+    def test_read_write_chunks_pipe_all_widths(self):
+        # A full read_chunks -> write_chunks pipe reproduces the source
+        # file byte for byte, including 24 bit data (which is decoded to
+        # int32 and therefore needs sampwidth passed explicitly).
+        rng = np.random.default_rng(4)
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            for sampwidth, dtype in [(1, np.uint8), (2, np.int16),
+                                     (3, np.int32), (4, np.int32)]:
+                info = np.iinfo(dtype)
+                data = rng.integers(info.min, info.max, size=(77, 2),
+                                    dtype=dtype)
+                wavio.write('src.wav', data, rate=12000,
+                            sampwidth=sampwidth)
+                original = open('src.wav', 'rb').read()
+                wavio.write_chunks(
+                    wavio.read_chunks('src.wav', chunk_size=13),
+                    'copy.wav', rate=12000, sampwidth=sampwidth)
+                assert open('copy.wav', 'rb').read() == original
+
+    def test_write_still_supports_scale_auto(self):
+        # The streaming interface rejects "auto", but the whole-array
+        # write() must keep supporting it unchanged.
+        data = np.array([-2.0, -1.0, 0.0, 1.0, 2.0])
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('auto.wav', data, rate=100, sampwidth=2,
+                        scale="auto")
+            w = wavio.read('auto.wav')
+            # The auto scale maps the extrema to the reachable limits;
+            # the negative minimum is -2**15 + 1 by wavio's convention.
+            assert w.data.min() == -2**15 + 1
+            assert w.data.max() == 2**15 - 1
+
+    def test_wavwriter_empty_file_is_valid(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            with wavio.WavWriter('empty.wav', rate=8000, sampwidth=2,
+                                 nchannels=1):
+                pass
+            w = wavio.read('empty.wav')
+            assert w.data.shape == (0, 1)
+            assert w.rate == 8000
+
+    def test_wavwriter_channel_mismatch(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            with wavio.WavWriter('x.wav', rate=8000, sampwidth=2,
+                                 nchannels=2) as writer:
+                with pytest.raises(ValueError):
+                    writer.write_chunk(np.zeros((3, 1), dtype=np.int16))
+
+    def test_wavwriter_mixed_kinds_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            with wavio.WavWriter('x.wav', rate=8000, sampwidth=2,
+                                 nchannels=1) as writer:
+                writer.write_chunk(np.zeros(3, dtype=np.int16))
+                with pytest.raises(ValueError):
+                    writer.write_chunk(np.zeros(3, dtype=np.float32))
+
+    def test_wavwriter_integer_scale_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            with wavio.WavWriter('x.wav', rate=8000, sampwidth=2,
+                                 nchannels=1, scale=2.0) as writer:
+                with pytest.raises(ValueError):
+                    writer.write_chunk(np.zeros(3, dtype=np.int16))
+
+    def test_wavwriter_auto_scale_rejected(self):
+        with pytest.raises(ValueError):
+            wavio.WavWriter('x.wav', rate=8000, sampwidth=2, nchannels=1,
+                            scale="auto")
+        with pytest.raises(ValueError):
+            wavio.write_chunks(iter([np.zeros(3)]), 'x.wav', rate=8000,
+                               sampwidth=2, scale="auto")
+
+    def test_write_chunks_empty_iterable(self):
+        with pytest.raises(ValueError):
+            wavio.write_chunks(iter([]), 'x.wav', rate=8000, sampwidth=2)
+
+    def test_wavwriter_clip_warn_aggregated(self):
+        data = np.array([0, 100, 200, 300, 400], dtype=np.int32)
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            with pytest.warns(wavio.ClippedDataWarning) as record:
+                with wavio.WavWriter('x.wav', rate=100, sampwidth=1,
+                                     nchannels=1) as writer:
+                    for i in range(0, len(data), 2):
+                        writer.write_chunk(data[i:i + 2])
+            # Exactly one aggregated warning, even though several
+            # chunks contain clipped values.
+            assert len(record) == 1
+
+    def test_wavwriter_clip_raise(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            with pytest.raises(wavio.ClippedDataError):
+                with wavio.WavWriter('x.wav', rate=100, sampwidth=1,
+                                     nchannels=1, clip='raise') as writer:
+                    writer.write_chunk(np.array([0, 300], dtype=np.int32))
+
+    def test_wavwriter_clip_ignore(self):
+        data = np.array([0, 100, 200, 300], dtype=np.int32)
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                with wavio.WavWriter('x.wav', rate=100, sampwidth=1,
+                                     nchannels=1, clip='ignore') as writer:
+                    for i in range(0, len(data), 2):
+                        writer.write_chunk(data[i:i + 2])
+            w = wavio.read('x.wav')
+            np.testing.assert_array_equal(
+                w.data[:, 0], np.array([0, 100, 200, 255], dtype=np.uint8))
+
+    def test_float_clip_semantics_match_in_chunks(self):
+        # Floating point clipping detection and the detailed message
+        # must be the same as on the whole-array path.
+        data = np.array([0.5, 0.25, 0.0, -0.9, -1.5, 0.0])
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('whole.wav', data, rate=8000, sampwidth=2,
+                        scale=1.0, clip='ignore')
+            whole_bytes = open('whole.wav', 'rb').read()
+
+            chunks = [data[i:i + 2] for i in range(0, len(data), 2)]
+            with pytest.warns(wavio.ClippedDataWarning):
+                wavio.write_chunks(chunks, 'chunked.wav', rate=8000,
+                                   sampwidth=2, scale=1.0)
+            assert open('chunked.wav', 'rb').read() == whole_bytes

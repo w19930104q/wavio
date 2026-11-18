@@ -1,12 +1,25 @@
 """
-The wavio module defines the functions:
+The wavio module defines the functions and classes:
 
 read(file)
     Read a WAV file and return a `wavio.Wav` object, with attributes
     `data`, `rate` and `sampwidth`.
 
+read_chunks(file, chunk_size)
+    Read a WAV file incrementally, yielding chunks of at most
+    `chunk_size` frames at a time.
+
 write(filename, data, rate, scale=None, sampwidth=None)
     Write a numpy array to a WAV file.
+
+WavWriter(file, rate, sampwidth, nchannels, scale=None, clip="warn")
+    Stream chunks of frames to a WAV file without holding the complete
+    data set in memory.  Use it as a context manager and call
+    `write_chunk` for each chunk of frames.
+
+write_chunks(chunks, file, rate, scale=None, sampwidth=None, clip="warn")
+    Write an iterable of array chunks to a WAV file; a convenience
+    wrapper around `WavWriter`.
 
 
 -----
@@ -216,6 +229,59 @@ def read(file: BinaryIO | str) -> Wav:
     return Wav(data=array, rate=rate, sampwidth=sampwidth)
 
 
+def read_chunks(file: BinaryIO | str, chunk_size: int):
+    """
+    Read a WAV file incrementally, one chunk of frames at a time.
+
+    This is a generator that yields two-dimensional numpy arrays, each
+    containing at most `chunk_size` frames (rows) of the WAV data.  In
+    contrast to `read`, the complete data set is never held in memory;
+    the working set is bounded by `chunk_size` and the sample width.
+    The conversion of each chunk (including the sign extension of 24 bit
+    data to 32 bit integers) is identical to that performed by `read`,
+    so concatenating the yielded chunks gives exactly the same array as
+    `read` would return::
+
+        w = wavio.read(filename)
+        chunks = list(wavio.read_chunks(filename, chunk_size=1000))
+        assert np.array_equal(np.concatenate(chunks, axis=0), w.data)
+
+    Parameters
+    ----------
+    file : string or file object
+        Either the name of a file or an open file pointer.
+    chunk_size : int
+        The maximum number of frames (rows) included in each yielded
+        array.  Must be a positive integer.  The final chunk (and only
+        the final chunk) may contain fewer frames.
+
+    Yields
+    ------
+    chunk : numpy array, shape (n, nchannels)
+        A chunk of the data read from the WAV file.  The data type is
+        determined by `sampwidth`, exactly as in `read` (uint8 for
+        8 bit, int16 for 16 bit, int32 for 24 and 32 bit).  Every
+        yielded array is two-dimensional, even for mono data.
+
+    Notes
+    -----
+    Like `read`, this function relies on the standard library `wave`
+    module and therefore shares its limitations (no compressed or
+    floating point WAV data).
+    """
+    if not isinstance(chunk_size, (int, _np.integer)) or chunk_size <= 0:
+        raise ValueError('chunk_size must be a positive integer.')
+
+    with _wave.open(file) as wav:
+        nchannels = wav.getnchannels()
+        sampwidth = wav.getsampwidth()
+        while True:
+            data = wav.readframes(chunk_size)
+            if not data:
+                break
+            yield _wav2array(nchannels, sampwidth, data)
+
+
 _sampwidth_dtypes = {1: _np.uint8,
                      2: _np.int16,
                      3: _np.int32,
@@ -226,8 +292,39 @@ _sampwidth_minmax = {1: (0, 255),
                      4: (-2**31, 2**31 - 1)}
 
 
-def _float_to_integer(x, sampwidth, scale=None, clip="warn"):
+def _auto_scale(x, c):
+    # The scale used by `write` when scale="auto".
+    return max(_np.max(_np.r_[x[x > 0], 0]),
+               _np.max(_np.r_[-x[x < 0], 0])/(1 + 1/c))
 
+
+def _float_to_integer_clip_message(scale, c):
+    return (f'Some data values have been clipped.  With scale={scale}, the '
+            'interval of input values that will not be clipped '
+            f'is [{-(1 + 1/c)*scale}, {scale}]')
+
+
+def _float_to_integer_chunk(x, sampwidth, scale=None, clip="warn"):
+    """
+    Convert one chunk of floating point data to the output integer type.
+
+    This function contains the actual scale/round/clip arithmetic.  It is
+    written so that applying it independently to the chunks of an array
+    produces exactly the same values as applying it to the complete
+    array, provided `scale` is not "auto" (the auto scale depends on the
+    extrema of the complete data set and cannot be computed from a
+    single chunk).
+
+    Returns
+    -------
+    y : numpy array
+        The converted chunk, with the output integer dtype.
+    clipped : bool
+        Whether at least one value in the chunk was clipped.
+    msg : str or None
+        The clipping message for this chunk, or None when no clipping
+        occurred.
+    """
     # For a given sampwidth and scale, the actual allowed
     # interval for float input is [-(1 + 1/c)*scale, scale],
     # where c = 2**(8*sampwidth - 1) - 0.5.  Values outside
@@ -236,10 +333,7 @@ def _float_to_integer(x, sampwidth, scale=None, clip="warn"):
     nbits = 8*sampwidth
     c = 2**(nbits - 1) - 0.5
 
-    if scale == "auto":
-        scale = max(_np.max(_np.r_[x[x > 0], 0]),
-                    _np.max(_np.r_[-x[x < 0], 0])/(1 + 1/c))
-    elif scale is None:
+    if scale is None:
         scale = 1.0
 
     if sampwidth == 1:
@@ -252,17 +346,54 @@ def _float_to_integer(x, sampwidth, scale=None, clip="warn"):
         int_max = 2**(nbits - 1) - 1
 
     scaled_x = x / scale
-    if _np.any(scaled_x > 1) or _np.any(scaled_x < -1 - 1/c):
-        msg = (f'Some data values have been clipped.  With scale={scale}, the '
-               'interval of input values that will not be clipped '
-               f'is [{-(1 + 1/c)*scale}, {scale}]')
+    clipped = bool(_np.any(scaled_x > 1)
+                   or _np.any(scaled_x < -1 - 1/c))
+    msg = _float_to_integer_clip_message(scale, c) if clipped else None
+    if clipped:
         if clip == "warn":
             _warnings.warn(ClippedDataWarning(msg))
         elif clip == "raise":
             raise ClippedDataError(msg)
 
     y = midpoint + _round_with_half_towards_zero(x/scale*c)
-    return _np.clip(y, int_min, int_max).astype(_sampwidth_dtypes[sampwidth])
+    return _np.clip(y, int_min, int_max).astype(_sampwidth_dtypes[sampwidth]), \
+        clipped, msg
+
+
+def _float_to_integer(x, sampwidth, scale=None, clip="warn"):
+    nbits = 8*sampwidth
+    c = 2**(nbits - 1) - 0.5
+
+    if scale == "auto":
+        scale = _auto_scale(x, c)
+
+    y, _, _ = _float_to_integer_chunk(x, sampwidth, scale=scale, clip=clip)
+    return y
+
+
+def _integer_to_integer(x, sampwidth, clip="warn"):
+    """
+    Clip (if needed) and convert one chunk of integer data to the
+    output integer type.  Integer values are never scaled or shifted.
+
+    Returns
+    -------
+    y : numpy array
+        The converted chunk, with the output integer dtype.
+    clipped : bool
+        Whether at least one value in the chunk was clipped.
+    """
+    outmin, outmax = _sampwidth_minmax[sampwidth]
+    clipped = bool(x.min() < outmin or x.max() > outmax)
+    if clipped:
+        if clip == "warn":
+            _warnings.warn(ClippedDataWarning())
+        elif clip == "raise":
+            raise ClippedDataError()
+    clip_min = max(outmin, _np.iinfo(x.dtype).min)
+    clip_max = min(outmax, _np.iinfo(x.dtype).max)
+    return x.clip(clip_min, clip_max).astype(_sampwidth_dtypes[sampwidth]), \
+        clipped
 
 
 def _round_with_half_towards_zero(x):
@@ -442,22 +573,12 @@ def write(file: BinaryIO | str,
         if sampwidth not in [1, 2, 3, 4]:
             raise ValueError('sampwidth must be 1, 2, 3 or 4.')
 
-    outdtype = _sampwidth_dtypes[sampwidth]
-    outmin, outmax = _sampwidth_minmax[sampwidth]
-
     if _np.issubdtype(data_arr.dtype, _np.integer):
         if scale is not None:
             raise ValueError('The scale parameter must not be set when the '
                              'input is an integer array.  No shifting or '
                              'scaling is done to integer input values.')
-        if (data_arr.min() < outmin or data_arr.max() > outmax):
-            if clip == "warn":
-                _warnings.warn(ClippedDataWarning())
-            elif clip == "raise":
-                raise ClippedDataError()
-        clip_min = max(outmin, _np.iinfo(data_arr.dtype).min)
-        clip_max = min(outmax, _np.iinfo(data_arr.dtype).max)
-        data_arr = data_arr.clip(clip_min, clip_max).astype(outdtype)
+        data_arr, _ = _integer_to_integer(data_arr, sampwidth, clip=clip)
     elif _np.issubdtype(data_arr.dtype, _np.floating):
         data_arr = _float_to_integer(data_arr, sampwidth,
                                      scale=scale, clip=clip)
@@ -487,3 +608,257 @@ def write(file: BinaryIO | str,
         w.setsampwidth(sampwidth)
         w.setframerate(rate)
         w.writeframes(wavdata)
+
+
+class WavWriter:
+    """
+    Write a WAV file one chunk of frames at a time.
+
+    `WavWriter` is a streaming counterpart of `write`: instead of holding
+    the complete data set in memory, it converts and writes each chunk
+    as it is received.  The peak working set is therefore bounded by the
+    size of the chunks passed to `write_chunk`, even when writing 24 bit
+    data (which requires an intermediate 32 bit representation).
+
+    The scaling, rounding and clipping rules are the same as in `write`;
+    each chunk is converted independently with the same arithmetic, so a
+    file written in chunks is byte-for-byte identical to a file written
+    with `write` from the concatenated chunks.
+
+    `WavWriter` is intended to be used as a context manager::
+
+        with wavio.WavWriter("large.wav", rate=44100, sampwidth=3,
+                             nchannels=2) as w:
+            for chunk in wavio.read_chunks("source.wav",
+                                           chunk_size=10000):
+                w.write_chunk(chunk)
+
+    Parameters
+    ----------
+    file : string or file object open for writing in binary mode
+        Either the name of a file or an open file pointer.
+    rate : int
+        The sampling frequency (i.e. frame rate) of the data.
+    sampwidth : int
+        The sample width, in bytes, of the output file.  Must be 1, 2,
+        3 or 4.
+    nchannels : int
+        The number of audio channels.  Every chunk written with
+        `write_chunk` must have this many columns.
+    scale : float, optional
+        Controls the output range when floating point chunks are
+        written, with the same meaning as in `write`.  It must not be
+        set when the chunks have an integer data type.  The string
+        ``"auto"`` is not supported by the streaming interface, because
+        the auto scale requires the extrema of the complete data set;
+        compute the desired scale up front and pass it as a number
+        instead.
+    clip : str, optional
+        ``"ignore"``, ``"warn"`` (the default) or ``"raise"``, with the
+        same meaning as in `write`.  With ``"warn"``, clipping detected
+        in any chunk is collected and reported with a single
+        `ClippedDataWarning` when the writer is closed, instead of one
+        warning per chunk.
+    """
+
+    def __init__(self,
+                 file: BinaryIO | str,
+                 rate: int,
+                 sampwidth: _sampwidth_t,
+                 nchannels: int,
+                 scale: float | None = None,
+                 clip: Literal["ignore", "warn", "raise"] = "warn"):
+        if clip not in ["ignore", "warn", "raise"]:
+            raise ValueError('clip must be one of "ignore", "warn" or '
+                             '"raise".')
+        if sampwidth not in [1, 2, 3, 4]:
+            raise ValueError('sampwidth must be 1, 2, 3 or 4.')
+        if scale == "auto":
+            raise ValueError('scale="auto" is not supported by the '
+                             'streaming WavWriter, because it requires the '
+                             'extrema of the complete data set.  Compute a '
+                             'numeric scale up front and pass that instead.')
+
+        self.file = file
+        self.rate = rate
+        self.sampwidth = sampwidth
+        self.nchannels = nchannels
+        self.scale = scale
+        self.clip = clip
+        self._kind = None
+        self._clipped = False
+        self._clip_message = None
+        self._closed = False
+        # The file is created up front, so a writer that is closed
+        # without any `write_chunk` calls still leaves a valid, empty
+        # WAV file on disk.
+        self._wav = _wave.open(file, 'wb')
+        self._wav.setnchannels(nchannels)
+        self._wav.setsampwidth(sampwidth)
+        self._wav.setframerate(rate)
+
+    def write_chunk(self, chunk: ArrayLike) -> None:
+        """
+        Convert and write one chunk of frames.
+
+        Parameters
+        ----------
+        chunk : numpy array, 1- or 2-dimensional, integer or floating point
+            The frames to append to the file.  A one-dimensional array
+            is treated as a mono chunk (one channel).  All chunks must
+            have the same number of channels and the same data type
+            kind (all integer or all floating point).
+        """
+        if self._closed:
+            raise ValueError('write_chunk called after the WavWriter was '
+                             'closed.')
+        a = _np.asarray(chunk)
+        if a.ndim == 1:
+            a = a.reshape(-1, 1)
+        elif a.ndim != 2:
+            raise ValueError('each chunk must be a 1- or 2-dimensional '
+                             'array.')
+        if a.shape[1] != self.nchannels:
+            raise ValueError(f'the chunk has {a.shape[1]} channels, but the '
+                             f'writer was created with nchannels='
+                             f'{self.nchannels}.')
+
+        kind = ('i' if _np.issubdtype(a.dtype, _np.integer)
+                else 'f' if _np.issubdtype(a.dtype, _np.floating)
+                else None)
+        if kind is None:
+            raise TypeError(f'unsupported input array data type: {a.dtype}')
+        if self._kind is not None and kind != self._kind:
+            raise ValueError('all chunks must have the same data type kind '
+                             '(all integer or all floating point).')
+        self._kind = kind
+
+        if kind == 'i':
+            if self.scale is not None:
+                raise ValueError('The scale parameter must not be set when '
+                                 'the input is an integer array.  No '
+                                 'shifting or scaling is done to integer '
+                                 'input values.')
+            # Detect clipping without emitting per-chunk warnings; the
+            # warning (if any) is emitted once, at close.
+            converted, clipped = _integer_to_integer(
+                a, self.sampwidth,
+                clip="raise" if self.clip == "raise" else "ignore")
+        else:
+            converted, clipped, msg = _float_to_integer_chunk(
+                a, self.sampwidth, scale=self.scale,
+                clip="raise" if self.clip == "raise" else "ignore")
+            if clipped:
+                self._clip_message = msg
+
+        if clipped:
+            self._clipped = True
+
+        wavdata = _array2wav(converted, self.sampwidth)
+        self._wav.writeframes(wavdata)
+
+    def close(self) -> None:
+        """
+        Flush and close the underlying WAV file.
+
+        If clipping was observed in any chunk and the writer was created
+        with ``clip="warn"``, a single `ClippedDataWarning` is issued
+        here.  Calling `close` more than once has no effect.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if self._wav is not None:
+            self._wav.close()
+        if self._clipped and self.clip == "warn":
+            if self._kind == 'f' and self._clip_message is not None:
+                _warnings.warn(ClippedDataWarning(self._clip_message))
+            else:
+                _warnings.warn(ClippedDataWarning())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
+def write_chunks(chunks,
+                 file: BinaryIO | str,
+                 rate: int,
+                 scale: float | Literal["auto"] | None = None,
+                 sampwidth: _sampwidth_t | None = None,
+                 clip: Literal["ignore", "warn", "raise"] = "warn") -> None:
+    """
+    Write an iterable of array chunks to a WAV file.
+
+    This is a convenience wrapper around `WavWriter` that mirrors the
+    signature of `write`; it is handy for piping a generator such as
+    `read_chunks` straight into a new file::
+
+        chunks = wavio.read_chunks("source.wav", chunk_size=10000)
+        wavio.write_chunks(chunks, "copy.wav", rate=44100)
+
+    The scaling, rounding and clipping semantics are identical to those
+    of `write`, and the resulting file is byte-for-byte identical to the
+    file produced by `write` from the concatenated chunks.
+
+    Parameters
+    ----------
+    chunks : iterable of numpy arrays
+        Each chunk must be a 1- or 2-dimensional integer or floating
+        point array.  All chunks must have the same data type kind and
+        the same number of channels.  The iterable must yield at least
+        one chunk.
+    file : string or file object open for writing in binary mode
+        Either the name of a file or an open file pointer.
+    rate : int
+        The sampling frequency (i.e. frame rate) of the data.
+    sampwidth : int, optional
+        The sample width, in bytes, of the output file.  If not given,
+        it is inferred from the data type of the first chunk, following
+        the same rules as in `write`.
+    scale : float, optional
+        Controls the output range for floating point chunks, with the
+        same meaning as in `write`.  It must not be set for integer
+        chunks, and ``"auto"`` is not supported by the streaming
+        interface.
+    clip : str, optional
+        ``"ignore"``, ``"warn"`` (the default) or ``"raise"``, with the
+        same meaning as in `write`.
+    """
+    if clip not in ["ignore", "warn", "raise"]:
+        raise ValueError('clip must be one of "ignore", "warn" or "raise".')
+    if scale == "auto":
+        raise ValueError('scale="auto" is not supported by write_chunks, '
+                         'because it requires the extrema of the complete '
+                         'data set.  Compute a numeric scale up front and '
+                         'pass that instead.')
+
+    iterator = iter(chunks)
+    try:
+        first = next(iterator)
+    except StopIteration:
+        raise ValueError('write_chunks requires at least one chunk.')
+
+    first_arr = _np.asarray(first)
+    if sampwidth is None:
+        if (not _np.issubdtype(first_arr.dtype, _np.integer)
+                or first_arr.itemsize > 4):
+            raise ValueError('when data.dtype is not an 8-, 16-, or 32-bit '
+                             'integer type, sampwidth must be specified.')
+        sampwidth = cast(_sampwidth_t, first_arr.itemsize)
+    elif sampwidth not in [1, 2, 3, 4]:
+        raise ValueError('sampwidth must be 1, 2, 3 or 4.')
+
+    nchannels = 1 if first_arr.ndim == 1 else first_arr.shape[1]
+    if _np.issubdtype(first_arr.dtype, _np.integer) and scale is not None:
+        raise ValueError('The scale parameter must not be set when the '
+                         'input is an integer array.  No shifting or '
+                         'scaling is done to integer input values.')
+
+    with WavWriter(file, rate=rate, sampwidth=sampwidth,
+                   nchannels=nchannels, scale=scale, clip=clip) as writer:
+        writer.write_chunk(first)
+        for chunk in iterator:
+            writer.write_chunk(chunk)

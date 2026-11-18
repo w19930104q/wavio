@@ -128,6 +128,50 @@ the output), we set `scale="auto"`.
     >>> w.data.min(), w.data.max()
     (-32768, 30517)
 
+Working with large files
+------------------------
+
+`wavio.read` loads the complete data set into memory, and `wavio.write`
+holds the complete input array while it converts and writes it.  For a
+24 bit file, the conversion also uses a 32 bit intermediate, so the
+peak working set is several times the size of the file.  For very large
+files, the module also provides a chunked, streaming API.
+
+`wavio.read_chunks` is a generator that yields at most `chunk_size`
+frames at a time; concatenating the chunks gives exactly the same array
+as `wavio.read` would return, including the sign extension of 24 bit
+data:
+
+    >>> chunks = list(wavio.read_chunks('large24.wav', chunk_size=10000))
+
+`wavio.WavWriter` writes one chunk at a time.  It is used as a context
+manager, and the scaling, rounding and clipping rules are identical to
+those of `wavio.write`:
+
+    >>> with wavio.WavWriter('copy24.wav', rate=22050, sampwidth=3,
+    ...                      nchannels=1) as writer:
+    ...     for chunk in wavio.read_chunks('large24.wav',
+    ...                                    chunk_size=10000):
+    ...         writer.write_chunk(chunk)
+
+`wavio.write_chunks` is a convenience wrapper around `WavWriter` that
+mirrors the signature of `wavio.write`, so an iterable of chunks can be
+written in a single call.  A file written in chunks is byte-for-byte
+identical to the file produced by `wavio.write` from the concatenated
+chunks:
+
+    >>> wavio.write_chunks(wavio.read_chunks('large24.wav',
+    ...                                      chunk_size=10000),
+    ...                    'copy24.wav', rate=22050, sampwidth=3)
+
+Because only one chunk is held in memory at a time, the peak working
+set is bounded by the chunk size rather than the file size.  Note that
+`scale="auto"` is not available on the streaming interface: the auto
+scale depends on the extrema of the complete data set, so compute a
+numeric scale up front and pass it explicitly.  When clipping occurs,
+`WavWriter` (with the default `clip="warn"`) emits a single
+`ClippedDataWarning` at close time instead of one warning per chunk.
+
 -----
 
 Author:     Warren Weckesser
