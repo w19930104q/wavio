@@ -5,7 +5,10 @@ wavio
 
 * ``wavio.read`` reads a WAV file and returns an object that holds the
   sampling rate, sample width (in bytes), and a numpy array containing the
-  data.
+  data.  Optional parameters allow the data to be resampled to a target
+  sample rate (linear interpolation) and/or remixed to a target number of
+  channels (cyclic repetition when adding channels, group averaging when
+  reducing channels) while it is read.
 * ``wavio.write`` writes a numpy array to a WAV file, optionally using a
   specified sample width.
 

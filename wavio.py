@@ -1,9 +1,10 @@
 """
 The wavio module defines the functions:
 
-read(file)
+read(file, rate=None, nchannels=None)
     Read a WAV file and return a `wavio.Wav` object, with attributes
-    `data`, `rate` and `sampwidth`.
+    `data`, `rate` and `sampwidth`.  Optionally resample the data to
+    a target sample rate and/or remix it to a target number of channels.
 
 write(filename, data, rate, scale=None, sampwidth=None)
     Write a numpy array to a WAV file.
@@ -156,7 +157,59 @@ class Wav:
                 f"sampwidth={self.sampwidth})")
 
 
-def read(file: BinaryIO | str) -> Wav:
+def _resample_linear(data, rate_in, rate_out):
+    """
+    Resample the 2-d array `data` from `rate_in` to `rate_out` using
+    linear interpolation (the same algorithm as `numpy.interp`).
+    Sample j of the output corresponds to time j/rate_out; values at
+    times outside the input time grid are set to the nearest end point
+    value.  The number of output samples is
+    ``round(data.shape[0] * rate_out / rate_in)``.
+    """
+    n_in = data.shape[0]
+    n_out = int(round(n_in * rate_out / rate_in))
+    if n_in == 0 or n_out == 0:
+        return _np.empty((n_out, data.shape[1]), dtype=_np.float64)
+    t_in = _np.arange(n_in) / rate_in
+    t_out = _np.arange(n_out) / rate_out
+    out = _np.empty((n_out, data.shape[1]), dtype=_np.float64)
+    for ch in range(data.shape[1]):
+        out[:, ch] = _np.interp(t_out, t_in, data[:, ch])
+    return out
+
+
+def _remix_channels(data, nchannels):
+    """
+    Remix the 2-d array `data` (shape (num_samples, m)) to `nchannels`
+    channels, using the following fixed strategy:
+
+    * If `nchannels` equals the current number of channels, the data is
+      returned unchanged.
+    * If `nchannels` is greater, the channels are repeated cyclically,
+      so output channel j is input channel (j mod m).  In particular,
+      mono input is copied to every output channel.
+    * If `nchannels` is smaller, the input channels are partitioned
+      into `nchannels` contiguous groups (input channel i belongs to
+      output group floor(i*nchannels/m)) and each output channel is
+      the mean of its group.  In particular, a mono output is the mean
+      of all the input channels.
+    """
+    m = data.shape[1]
+    if nchannels == m:
+        return data
+    if nchannels > m:
+        reps = -(-nchannels // m)  # ceiling division
+        return _np.tile(data, (1, reps))[:, :nchannels]
+    groups = (_np.arange(m) * nchannels) // m
+    out = _np.empty((data.shape[0], nchannels), dtype=_np.float64)
+    for j in range(nchannels):
+        out[:, j] = data[:, groups == j].mean(axis=1)
+    return out
+
+
+def read(file: BinaryIO | str,
+         rate: int | None = None,
+         nchannels: int | None = None) -> Wav:
     """
     Read a WAV file.
 
@@ -164,6 +217,18 @@ def read(file: BinaryIO | str) -> Wav:
     ----------
     file : string or file object
         Either the name of a file or an open file pointer.
+    rate : int, optional
+        Target sampling frequency.  If given and different from the
+        sample rate of the file, the data is resampled to `rate` using
+        linear interpolation.  If not given, no resampling is done.
+    nchannels : int, optional
+        Target number of channels.  If given and different from the
+        number of channels in the file, the channels are remixed with
+        a fixed strategy: channels are repeated cyclically when the
+        target has more channels than the source (so mono is copied to
+        all channels), and channels are averaged in contiguous groups
+        when the target has fewer (so a mono target is the mean of all
+        channels).  If not given, no remixing is done.
 
     Returns
     -------
@@ -184,12 +249,21 @@ def read(file: BinaryIO | str) -> Wav:
                         3          numpy.int32
                         4          numpy.int32
 
+                If `rate` or `nchannels` is given, the data is converted
+                to 64 bit floating point before resampling/remixing, and
+                the returned array has dtype ``numpy.float64`` (the values
+                remain on the same scale as the integer samples in the
+                file).
+
             rate : int
-                The sampling frequency (i.e. frame rate or sample rate) of the
-                WAV file.
+                The sampling frequency (i.e. frame rate or sample rate) of
+                the data.  If the `rate` parameter was given, this is that
+                value; otherwise it is the sample rate of the WAV file.
             sampwidth : int
                 The sample width (i.e. number of bytes per sample) of the
-                WAV file.  For example, `sampwidth == 3` is a 24 bit WAV file.
+                WAV file.  For example, `sampwidth == 3` is a 24 bit WAV
+                file.  This describes the file as read; it is not changed
+                by the `rate` or `nchannels` parameters.
 
     Notes
     -----
@@ -205,15 +279,38 @@ def read(file: BinaryIO | str) -> Wav:
     array `wav.data` is the data that was in the file.  When the file
     contains 24 bit samples, the resulting numpy array is 32 bit integers,
     with values that have been sign-extended.
+
+    When `rate` is given, sample j of the output corresponds to time
+    ``j/rate``; values at times outside the input time grid are set to
+    the nearest end point value.  The number of output samples is
+    ``round(num_input_samples * rate / file_rate)``.
     """
     with _wave.open(file) as wav:
-        rate = wav.getframerate()
-        nchannels = wav.getnchannels()
+        file_rate = wav.getframerate()
+        nchannels_in = wav.getnchannels()
         sampwidth = wav.getsampwidth()
         nframes = wav.getnframes()
         data = wav.readframes(nframes)
-    array = _wav2array(nchannels, sampwidth, data)
-    return Wav(data=array, rate=rate, sampwidth=sampwidth)
+    array = _wav2array(nchannels_in, sampwidth, data)
+    if rate is None and nchannels is None:
+        return Wav(data=array, rate=file_rate, sampwidth=sampwidth)
+
+    if rate is None:
+        rate = file_rate
+    elif int(rate) != rate or rate <= 0:
+        raise ValueError('rate must be a positive integer.')
+    rate = int(rate)
+    if nchannels is not None:
+        if int(nchannels) != nchannels or nchannels <= 0:
+            raise ValueError('nchannels must be a positive integer.')
+        nchannels = int(nchannels)
+
+    converted = array.astype(_np.float64)
+    if rate != file_rate:
+        converted = _resample_linear(converted, file_rate, rate)
+    if nchannels is not None:
+        converted = _remix_channels(converted, nchannels)
+    return Wav(data=converted, rate=rate, sampwidth=sampwidth)
 
 
 _sampwidth_dtypes = {1: _np.uint8,

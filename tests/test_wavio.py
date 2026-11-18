@@ -269,3 +269,166 @@ class TestWavio:
                                  2**23 - 2, 2**23 - 1, 2**23 - 1])
             actual = w.data[:, 0]
             np.testing.assert_array_equal(actual, expected)
+
+
+# Fixed waveform matrix used by the resample/remix acceptance tests.
+# 12 frames, 2 channels, int16.
+waveform2ch = np.array([[0, 1000],
+                        [100, -900],
+                        [-200, 800],
+                        [300, -700],
+                        [-400, 600],
+                        [500, -500],
+                        [-600, 400],
+                        [700, -300],
+                        [-800, 200],
+                        [900, -100],
+                        [-1000, 0],
+                        [1100, 100]], dtype=int16le)
+
+
+def ref_resample_linear(data, rate_in, rate_out):
+    # Independent reference implementation of linear-interpolation
+    # resampling, written with an explicit Python loop.
+    data = np.asarray(data, dtype=np.float64)
+    n_in = data.shape[0]
+    n_out = int(round(n_in * rate_out / rate_in))
+    out = np.empty((n_out, data.shape[1]))
+    for j in range(n_out):
+        t = j * rate_in / rate_out  # in units of input samples
+        i = min(int(t), n_in - 1)
+        frac = t - i
+        if i + 1 < n_in:
+            out[j] = data[i] * (1 - frac) + data[i + 1] * frac
+        else:
+            out[j] = data[i]
+    return out
+
+
+class TestReadConvert:
+
+    def test_no_params_byte_identical(self):
+        # With no conversion parameters, read() must behave exactly as
+        # before: the data must match the bytes in the file exactly.
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('w.wav', waveform2ch, 8000)
+            w = wavio.read('w.wav')
+            assert w.rate == 8000
+            assert w.sampwidth == 2
+            assert w.data.dtype == int16le
+            np.testing.assert_array_equal(w.data, waveform2ch)
+            with wave.open('w.wav', 'r') as f:
+                raw = f.readframes(f.getnframes())
+            assert w.data.tobytes() == raw
+
+    def test_resample_upsample(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('w.wav', waveform2ch, 8000)
+            w = wavio.read('w.wav', rate=16000)
+            assert w.rate == 16000
+            assert w.sampwidth == 2
+            assert w.data.dtype == np.float64
+            assert w.data.shape == (24, 2)
+            expected = ref_resample_linear(waveform2ch, 8000, 16000)
+            np.testing.assert_allclose(w.data, expected, rtol=1e-12,
+                                       atol=1e-9)
+
+    def test_resample_downsample(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('w.wav', waveform2ch, 8000)
+            w = wavio.read('w.wav', rate=3000)
+            assert w.rate == 3000
+            # round(12 * 3000/8000) = round(4.5) = 4 (banker's rounding)
+            assert w.data.shape == (4, 2)
+            expected = ref_resample_linear(waveform2ch, 8000, 3000)
+            np.testing.assert_allclose(w.data, expected, rtol=1e-12,
+                                       atol=1e-9)
+
+    def test_resample_same_rate_is_noop_values(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('w.wav', waveform2ch, 8000)
+            w = wavio.read('w.wav', rate=8000)
+            assert w.rate == 8000
+            assert w.data.dtype == np.float64
+            np.testing.assert_array_equal(w.data,
+                                          waveform2ch.astype(np.float64))
+
+    def test_remix_mono_to_stereo(self):
+        mono = waveform2ch[:, :1]
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('w.wav', mono, 8000)
+            w = wavio.read('w.wav', nchannels=2)
+            assert w.data.shape == (len(mono), 2)
+            expected = np.repeat(mono.astype(np.float64), 2, axis=1)
+            np.testing.assert_array_equal(w.data, expected)
+
+    def test_remix_stereo_to_mono(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('w.wav', waveform2ch, 8000)
+            w = wavio.read('w.wav', nchannels=1)
+            assert w.data.shape == (len(waveform2ch), 1)
+            expected = waveform2ch.astype(np.float64).mean(axis=1,
+                                                           keepdims=True)
+            np.testing.assert_allclose(w.data, expected, rtol=1e-12,
+                                       atol=1e-9)
+
+    def test_remix_quad_to_stereo(self):
+        quad = np.column_stack([waveform2ch[:, 0], waveform2ch[:, 1],
+                                2 * waveform2ch[:, 0], -waveform2ch[:, 1]])
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('w.wav', quad.astype(int16le), 8000)
+            w = wavio.read('w.wav', nchannels=2)
+            assert w.data.shape == (len(quad), 2)
+            # Fixed strategy: channels (0, 1) averaged, channels (2, 3)
+            # averaged.
+            expected = np.column_stack([quad[:, :2].mean(axis=1),
+                                        quad[:, 2:].mean(axis=1)])
+            np.testing.assert_allclose(w.data, expected, rtol=1e-12,
+                                       atol=1e-9)
+
+    def test_remix_stereo_to_triple(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('w.wav', waveform2ch, 8000)
+            w = wavio.read('w.wav', nchannels=3)
+            assert w.data.shape == (len(waveform2ch), 3)
+            # Fixed strategy: cyclic repetition of channels.
+            expected = np.column_stack([waveform2ch[:, 0],
+                                        waveform2ch[:, 1],
+                                        waveform2ch[:, 0]]).astype(np.float64)
+            np.testing.assert_array_equal(w.data, expected)
+
+    def test_resample_and_remix(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('w.wav', waveform2ch, 8000)
+            w = wavio.read('w.wav', rate=16000, nchannels=1)
+            assert w.rate == 16000
+            assert w.data.shape == (24, 1)
+            expected = ref_resample_linear(waveform2ch, 8000, 16000)
+            expected = expected.mean(axis=1, keepdims=True)
+            np.testing.assert_allclose(w.data, expected, rtol=1e-12,
+                                       atol=1e-9)
+
+    @pytest.mark.parametrize('rate', [0, -1, 2.5])
+    def test_invalid_rate(self, rate):
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('w.wav', waveform2ch, 8000)
+            with pytest.raises(ValueError):
+                wavio.read('w.wav', rate=rate)
+
+    @pytest.mark.parametrize('nchannels', [0, -2, 1.5])
+    def test_invalid_nchannels(self, nchannels):
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            wavio.write('w.wav', waveform2ch, 8000)
+            with pytest.raises(ValueError):
+                wavio.read('w.wav', nchannels=nchannels)
