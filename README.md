@@ -11,11 +11,19 @@ wavio
 
 The functions can read and write 8-, 16-, 24- and 32-bit integer WAV files.
 
-The module uses the ``wave`` module in Python's standard library, so it has
-the same limitations as that module.  In particular, the ``wave`` module
-does not support compressed WAV files, and it does not handle floating
-point WAV files.  When floating point data is passed to ``wavio.write`` it
-is converted to integers before being written to the WAV file.
+The write path uses the ``wave`` module in Python's standard library, so it
+has the same limitations as that module.  In particular, the ``wave`` module
+does not support compressed WAV files, and it does not handle floating point
+WAV files.  When floating point data is passed to ``wavio.write`` it is
+converted to integers before being written to the WAV file.
+
+The read path uses a self-contained RIFF parser instead of ``wave``.  When a
+malformed file is encountered, ``wavio.read`` raises ``wavio.WavReadError``
+(a subclass of ``ValueError``).  The error message, and the exception's
+``chunk`` and ``offset`` attributes, identify the four-byte RIFF chunk in
+which the problem was found and the absolute byte offset within the file, so
+that bad files can be located in batch processing.  Well-formed files are
+read back identically to the old ``wave``-based implementation.
 
 ``wavio`` requires Python 3.10 or later.
 
